@@ -160,11 +160,25 @@ type tcpDialer struct {
 	once sync.Once
 }
 
-const maxDialConcurrency = 1000
+var maxDialConcurrency = 1000
+
+// SetMaxDialConcurrency sets the maximum number of concurrent Dails
+// that can be performed. Setting this to 0 means unlimited.
+//
+// The initial max concurrency is set to 1000.
+//
+// WARNING: This function needs to be called before any Dials are
+// performed. Calling this function after calling any of the Dial
+// functions might not have any effect and can cause a race condition.
+func SetMaxDialConcurrency(concurrency int) {
+	maxDialConcurrency = concurrency
+}
 
 func (d *tcpDialer) NewDial(timeout time.Duration) DialFunc {
 	d.once.Do(func() {
-		d.concurrencyCh = make(chan struct{}, maxDialConcurrency)
+		if maxDialConcurrency > 0 {
+			d.concurrencyCh = make(chan struct{}, maxDialConcurrency)
+		}
 		d.tcpAddrsMap = make(map[string]*tcpAddrEntry)
 		go d.tcpAddrsClean()
 	})
@@ -203,26 +217,28 @@ func tryDial(network string, addr *net.TCPAddr, deadline time.Time, concurrencyC
 		return nil, ErrDialTimeout
 	}
 
-	select {
-	case concurrencyCh <- struct{}{}:
-	default:
-		tc := acquireTimer(timeout)
-		isTimeout := false
+	if concurrencyCh != nil {
 		select {
 		case concurrencyCh <- struct{}{}:
-		case <-tc.C:
-			isTimeout = true
+		default:
+			tc := acquireTimer(timeout)
+			isTimeout := false
+			select {
+			case concurrencyCh <- struct{}{}:
+			case <-tc.C:
+				isTimeout = true
+			}
+			releaseTimer(tc)
+			if isTimeout {
+				return nil, ErrDialTimeout
+			}
 		}
-		releaseTimer(tc)
-		if isTimeout {
+
+		timeout = -time.Since(deadline)
+		if timeout <= 0 {
+			<-concurrencyCh
 			return nil, ErrDialTimeout
 		}
-	}
-
-	timeout = -time.Since(deadline)
-	if timeout <= 0 {
-		<-concurrencyCh
-		return nil, ErrDialTimeout
 	}
 
 	chv := dialResultChanPool.Get()
@@ -234,7 +250,9 @@ func tryDial(network string, addr *net.TCPAddr, deadline time.Time, concurrencyC
 		var dr dialResult
 		dr.conn, dr.err = net.DialTCP(network, nil, addr)
 		ch <- dr
-		<-concurrencyCh
+		if concurrencyCh != nil {
+			<-concurrencyCh
+		}
 	}()
 
 	var (
